@@ -26,10 +26,10 @@ print("="*70)
 print("\n📋 CONFIGURATION")
 print("-"*70)
 
-API_ID = input("Enter your API_ID: ").strip() or '5041713'
-API_HASH = input("Enter your API_HASH: ").strip() or '9c27474d00a8b8236307692d4b6f0434'
-BOT_TOKEN = input("Enter your BOT_TOKEN: ").strip() or '8477203017:AAHarKtQkBdnfMR7DidTCd6tvE0ziAu0wFc'
-PHONE = input("Enter your phone number: ").strip() or '+917540892472'
+API_ID = '5041713'
+API_HASH = '9c27474d00a8b8236307692d4b6f0434'
+BOT_TOKEN = '8477203017:AAHarKtQkBdnfMR7DidTCd6tvE0ziAu0wFc'
+PHONE = '+917540892472'
 
 print(f"\n✅ Configuration received")
 
