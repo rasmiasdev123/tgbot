@@ -7,6 +7,7 @@ import os
 import asyncio
 import time
 from telethon import TelegramClient, events
+from telethon.errors import SessionPasswordNeededError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import pickle
@@ -16,7 +17,7 @@ print("🚀 TELEGRAM VIDEO DOWNLOADER BOT - SEQUENTIAL MODE")
 print("="*70)
 
 # ============ CONFIGURATION ============
-API_ID = '5041713'
+API_ID = 5041713  # Changed from string to integer
 API_HASH = '9c27474d00a8b8236307692d4b6f0434'
 BOT_TOKEN = '8477203017:AAHarKtQkBdnfMR7DidTCd6tvE0ziAu0wFc'
 PHONE = '+917540892472'
@@ -137,8 +138,9 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
         try:
             message = await user_client.get_messages(channel_id, ids=msg_id)
         except Exception as e:
-            await status_msg.edit(f"❌ [{idx}/{total}] Access denied or invalid link")
-            return {'success': False, 'error': str(e)[:50], 'file_name': f'Link {idx}', 'link': link_text}
+            error_msg = str(e)
+            await status_msg.edit(f"❌ [{idx}/{total}] Error: {error_msg[:30]}")
+            return {'success': False, 'error': error_msg[:50], 'file_name': f'Link {idx}', 'link': link_text}
         
         if not message or not message.media:
             await status_msg.edit(f"❌ [{idx}/{total}] No media found")
@@ -364,30 +366,54 @@ async def main():
     print("🚀 STARTING BOT - SEQUENTIAL MODE")
     print("="*70)
     
-    if not os.path.exists('user.session'):
-        print("\n❌ ERROR: user.session file not found!")
-        print("\n📝 To create session file:")
-        print("1. Run the session generator script locally")
-        print("2. Complete the phone verification")
-        print("3. Upload the generated 'user.session' file to server")
-        return
-    
     if not os.path.exists(TOKEN_PICKLE):
         print("\n❌ token.pickle not found!")
         return
     
+    # Initialize clients with proper types
+    print("\n📱 Creating bot client...")
     bot = TelegramClient('bot', API_ID, API_HASH)
+    
+    print("👤 Creating user client...")
     user = TelegramClient('user', API_ID, API_HASH)
     
-    print("\n📱 Starting bot...")
-    await bot.start(bot_token=BOT_TOKEN)
-    bot_me = await bot.get_me()
-    print(f"   ✅ Bot: @{bot_me.username}")
-    
-    print("\n👤 Starting user client with session file...")
-    await user.start()
-    user_me = await user.get_me()
-    print(f"   ✅ User: {user_me.first_name}")
+    try:
+        print("\n🔐 Starting bot authentication...")
+        await bot.start(bot_token=BOT_TOKEN)
+        bot_me = await bot.get_me()
+        print(f"   ✅ Bot: @{bot_me.username}")
+        
+        print("\n🔐 Starting user authentication...")
+        
+        # Check if session exists
+        if os.path.exists('user.session'):
+            print("   📂 Session file found, attempting to connect...")
+            await user.connect()
+            
+            if not await user.is_user_authorized():
+                print("   ⚠️  Session expired or invalid")
+                print("   🔄 Please delete user.session and regenerate it")
+                return
+            else:
+                print("   ✅ Session valid, authorizing...")
+                # Authorize using the session
+                await user.start(phone=PHONE)
+        else:
+            print("   ⚠️  No session file found")
+            print("   🔄 Starting interactive login...")
+            await user.start(phone=PHONE)
+        
+        user_me = await user.get_me()
+        print(f"   ✅ User: {user_me.first_name} (@{user_me.username or 'No username'})")
+        
+    except Exception as e:
+        print(f"\n❌ Authentication failed: {e}")
+        print("\n🔧 Troubleshooting steps:")
+        print("1. Delete user.session file if it exists")
+        print("2. Make sure API_ID and API_HASH are correct")
+        print("3. Check phone number format (+917540892472)")
+        print("4. Regenerate session file if needed")
+        return
     
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(event):
