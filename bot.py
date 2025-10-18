@@ -34,7 +34,7 @@ CONNECTION_RETRIES = 3
 
 # Track processing - allow queue
 user_queue = {}
-user_stop_flag = {}  # Flag to stop ongoing downloads
+user_tasks = {}  # Store running tasks for each user
 
 # ============ GOOGLE DRIVE ============
 def get_drive_service():
@@ -508,4 +508,16 @@ async def main():
     print(f"\n⏳ Press Ctrl+C to stop\n")
     
     try:
-        
+        await bot.run_until_disconnected()
+    except KeyboardInterrupt:
+        print("\n👋 Stopping...")
+    finally:
+        await bot.disconnect()
+        await user.disconnect()
+        print("✅ Stopped")
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Goodbye!")
