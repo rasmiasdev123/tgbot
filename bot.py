@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Optimized Telegram Video Downloader Bot - NO INPUT REQUIRED
-Uses pre-generated session file
+Sequential Telegram Video Downloader Bot
+Processes multiple links one after another - no timeouts
 """
 import os
 import asyncio
@@ -12,7 +12,7 @@ from googleapiclient.http import MediaFileUpload
 import pickle
 
 print("="*70)
-print("🚀 TELEGRAM VIDEO DOWNLOADER BOT - NO INPUT MODE")
+print("🚀 TELEGRAM VIDEO DOWNLOADER BOT - SEQUENTIAL MODE")
 print("="*70)
 
 # ============ CONFIGURATION ============
@@ -28,14 +28,11 @@ DOWNLOAD_DIR = 'downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Performance settings
-MAX_PARALLEL_DOWNLOADS = 5
 PROGRESS_UPDATE_INTERVAL = 3
-BATCH_STATUS_UPDATE_INTERVAL = 2
 CONNECTION_RETRIES = 3
-CHUNK_SIZE = 1024 * 1024
 
-# Track processing
-user_processing = {}
+# Track processing - allow queue
+user_queue = {}
 
 # ============ GOOGLE DRIVE ============
 def get_drive_service():
@@ -129,7 +126,7 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
     status_msg = None
     
     try:
-        status_msg = await event.respond(f"🔄 [{idx}/{total}] Initializing...")
+        status_msg = await event.respond(f"📍 [{idx}/{total}] Initializing...")
         
         channel_id, msg_id = parse_link(link_text)
         if not channel_id:
@@ -138,13 +135,7 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
         
         await status_msg.edit(f"🔍 [{idx}/{total}] Fetching message...")
         try:
-            message = await asyncio.wait_for(
-                user_client.get_messages(channel_id, ids=msg_id),
-                timeout=30.0
-            )
-        except asyncio.TimeoutError:
-            await status_msg.edit(f"⏱️ [{idx}/{total}] Timeout fetching message")
-            return {'success': False, 'error': 'Fetch timeout', 'file_name': f'Link {idx}', 'link': link_text}
+            message = await user_client.get_messages(channel_id, ids=msg_id)
         except Exception as e:
             await status_msg.edit(f"❌ [{idx}/{total}] Access denied or invalid link")
             return {'success': False, 'error': str(e)[:50], 'file_name': f'Link {idx}', 'link': link_text}
@@ -160,32 +151,36 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
                     file_name = attr.file_name
                     break
         
+        # Update batch summary if exists
+        if batch_summary_msg:
+            try:
+                await batch_summary_msg.edit(
+                    f"📦 **PROCESSING QUEUE**\n\n"
+                    f"🔄 Currently downloading: [{idx}/{total}]\n"
+                    f"📄 `{file_name[:40]}`\n\n"
+                    f"⏳ Remaining: {total - idx} files"
+                )
+            except:
+                pass
+        
         progress = DownloadProgress(file_name, status_msg, idx, total)
         await status_msg.edit(f"📥 [{idx}/{total}] Starting download...\n📄 `{file_name[:40]}`")
         
         file_path = None
         for attempt in range(CONNECTION_RETRIES):
             try:
-                file_path = await asyncio.wait_for(
-                    user_client.download_media(
-                        message.media,
-                        file=DOWNLOAD_DIR,
-                        progress_callback=progress.update
-                    ),
-                    timeout=6000.0
+                file_path = await user_client.download_media(
+                    message.media,
+                    file=DOWNLOAD_DIR,
+                    progress_callback=progress.update
                 )
                 if file_path:
                     break
-            except asyncio.TimeoutError:
-                if attempt == CONNECTION_RETRIES - 1:
-                    await status_msg.edit(f"⏱️ [{idx}/{total}] Download timeout\n📄 `{file_name}`")
-                    return {'success': False, 'error': 'Download timeout', 'file_name': file_name, 'link': link_text}
-                await status_msg.edit(f"⚠️ [{idx}/{total}] Timeout, retrying... ({attempt+2}/{CONNECTION_RETRIES})")
-                await asyncio.sleep(2 ** attempt)
             except Exception as e:
                 if attempt == CONNECTION_RETRIES - 1:
-                    await status_msg.edit(f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`")
+                    await status_msg.edit(f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`\nError: {str(e)[:30]}")
                     return {'success': False, 'error': str(e)[:50], 'file_name': file_name, 'link': link_text}
+                await status_msg.edit(f"⚠️ [{idx}/{total}] Retrying... ({attempt+2}/{CONNECTION_RETRIES})")
                 await asyncio.sleep(2 ** attempt)
         
         if not file_path:
@@ -228,78 +223,65 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
                 pass
         return {'success': False, 'error': str(e)[:50], 'file_name': file_name}
 
-# ============ BATCH PROCESSOR ============
-async def process_batch(event, user_client, links):
+# ============ SEQUENTIAL BATCH PROCESSOR ============
+async def process_sequential_batch(event, user_client, links):
     user_id = event.sender_id
     total = len(links)
     start_time = time.time()
     
     batch_msg = await event.respond(
-        f"📦 **BATCH PROCESSING STARTED**\n\n"
+        f"📦 **BATCH QUEUED**\n\n"
         f"📊 Total files: {total}\n"
-        f"⚡ Parallel downloads: {MAX_PARALLEL_DOWNLOADS}\n"
-        f"🔄 Status: Initializing...\n\n"
-        f"Progress: 0/{total} (0%)\n"
-        f"✅ Completed: 0\n"
-        f"❌ Failed: 0\n"
-        f"⏳ Processing: 0"
+        f"🔄 Processing mode: Sequential (one by one)\n"
+        f"📍 Status: Starting...\n\n"
+        f"⏳ All files will be processed automatically"
     )
     
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_DOWNLOADS)
+    results = []
     completed_count = 0
     failed_count = 0
-    processing_count = 0
     
-    async def process_with_semaphore(link, idx):
-        nonlocal completed_count, failed_count, processing_count
-        async with semaphore:
-            processing_count += 1
-            result = await process_single_file(event, user_client, link, idx, total, batch_msg)
-            processing_count -= 1
-            if result and result.get('success'):
-                completed_count += 1
-            else:
-                failed_count += 1
-            return result
-    
-    tasks = [process_with_semaphore(link, idx) for idx, link in enumerate(links, 1)]
-    
-    async def update_batch_status():
-        while completed_count + failed_count < total:
-            await asyncio.sleep(BATCH_STATUS_UPDATE_INTERVAL)
-            progress_percent = ((completed_count + failed_count) / total) * 100
+    # Process each link one by one
+    for idx, link in enumerate(links, 1):
+        result = await process_single_file(event, user_client, link, idx, total, batch_msg)
+        results.append(result)
+        
+        if result and result.get('success'):
+            completed_count += 1
+        else:
+            failed_count += 1
+        
+        # Update batch status after each file
+        try:
             elapsed = int(time.time() - start_time)
-            try:
-                await batch_msg.edit(
-                    f"📦 **BATCH PROCESSING**\n\n"
-                    f"📊 Total: {total} files\n"
-                    f"⚡ Parallel: {MAX_PARALLEL_DOWNLOADS}\n"
-                    f"⏱️ Elapsed: {elapsed//60}m {elapsed%60}s\n\n"
-                    f"Progress: {completed_count + failed_count}/{total} ({progress_percent:.1f}%)\n"
-                    f"✅ Completed: {completed_count}\n"
-                    f"❌ Failed: {failed_count}\n"
-                    f"⏳ Processing: {processing_count}"
-                )
-            except:
-                pass
+            await batch_msg.edit(
+                f"📦 **PROCESSING QUEUE**\n\n"
+                f"📊 Total: {total} files\n"
+                f"⏱️ Elapsed: {elapsed//60}m {elapsed%60}s\n\n"
+                f"Progress: {idx}/{total} ({(idx/total)*100:.1f}%)\n"
+                f"✅ Completed: {completed_count}\n"
+                f"❌ Failed: {failed_count}\n"
+                f"⏳ Remaining: {total - idx}"
+            )
+        except:
+            pass
     
-    status_task = asyncio.create_task(update_batch_status())
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    status_task.cancel()
-    
+    # Final summary
     total_time = int(time.time() - start_time)
     completed = [r for r in results if isinstance(r, dict) and r.get('success')]
     failed = [r for r in results if not isinstance(r, dict) or not r.get('success')]
     total_size = sum(r.get('size', 0) for r in completed)
     
-    summary = f"🎉 **BATCH COMPLETED!**\n\n"
+    summary = f"🎉 **ALL FILES PROCESSED!**\n\n"
     summary += f"📊 **Statistics:**\n"
     summary += f"Total files: {total}\n"
     summary += f"✅ Successful: {len(completed)}\n"
     summary += f"❌ Failed: {len(failed)}\n"
     summary += f"📦 Total size: {total_size:.1f} MB\n"
     summary += f"⏱️ Total time: {total_time//60}m {total_time%60}s\n"
-    summary += f"⚡ Avg speed: {total_size/total_time if total_time > 0 else 0:.2f} MB/s\n\n"
+    if total_size > 0 and total_time > 0:
+        summary += f"⚡ Avg speed: {total_size/total_time:.2f} MB/s\n"
+    summary += "\n"
     
     if completed:
         summary += f"**✅ Completed Files ({len(completed)}):**\n"
@@ -318,20 +300,26 @@ async def process_batch(event, user_client, links):
     
     await batch_msg.edit(summary)
     
-    if user_id in user_processing:
-        user_processing[user_id] = False
+    if user_id in user_queue:
+        del user_queue[user_id]
 
 # ============ MESSAGE HANDLER ============
 async def handle_message(event, user_client):
     user_id = event.sender_id
     text = event.raw_text
     
-    if user_processing.get(user_id, False):
-        await event.respond("⏳ Already processing your request. Please wait...")
+    # Check if user already has a queue
+    if user_id in user_queue and user_queue[user_id]:
+        await event.respond(
+            "⚠️ **Already processing your files!**\n\n"
+            "Your links are being processed one by one.\n"
+            "Please wait for completion before sending more.\n\n"
+            "💡 You can send multiple links at once - they'll be processed sequentially."
+        )
         return
     
     try:
-        user_processing[user_id] = True
+        user_queue[user_id] = True
         
         links = []
         for line in text.split('\n'):
@@ -340,27 +328,42 @@ async def handle_message(event, user_client):
                 links.append(line)
         
         if not links:
-            await event.respond("❌ No valid Telegram links found\n\nSupported formats:\n• t.me/channel/123\n• https://t.me/c/123/456")
+            await event.respond(
+                "❌ No valid Telegram links found\n\n"
+                "**Supported formats:**\n"
+                "• t.me/channel/123\n"
+                "• https://t.me/c/123/456\n\n"
+                "💡 **Tip:** Send multiple links at once (one per line)\n"
+                "They'll be processed one after another automatically!"
+            )
+            if user_id in user_queue:
+                del user_queue[user_id]
             return
         
         if len(links) == 1:
-            await process_single_file(event, user_client, links[0], 1, 1)
+            result = await process_single_file(event, user_client, links[0], 1, 1)
+            if user_id in user_queue:
+                del user_queue[user_id]
         else:
-            await process_batch(event, user_client, links)
+            await event.respond(
+                f"📝 **Received {len(links)} links**\n\n"
+                f"🔄 Processing sequentially (one by one)\n"
+                f"⏳ No need to wait - all will be processed automatically\n\n"
+                f"You'll get individual updates for each file!"
+            )
+            await process_sequential_batch(event, user_client, links)
     
     except Exception as e:
         await event.respond(f"❌ Unexpected error: {str(e)}")
-    
-    finally:
-        user_processing[user_id] = False
+        if user_id in user_queue:
+            del user_queue[user_id]
 
-# ============ MAIN - NO INPUT REQUIRED ============
+# ============ MAIN ============
 async def main():
     print("\n" + "="*70)
-    print("🚀 STARTING BOT - NO INPUT MODE")
+    print("🚀 STARTING BOT - SEQUENTIAL MODE")
     print("="*70)
     
-    # Check for session file
     if not os.path.exists('user.session'):
         print("\n❌ ERROR: user.session file not found!")
         print("\n📝 To create session file:")
@@ -373,7 +376,6 @@ async def main():
         print("\n❌ token.pickle not found!")
         return
     
-    # Create clients - will use existing session
     bot = TelegramClient('bot', API_ID, API_HASH)
     user = TelegramClient('user', API_ID, API_HASH)
     
@@ -383,32 +385,35 @@ async def main():
     print(f"   ✅ Bot: @{bot_me.username}")
     
     print("\n👤 Starting user client with session file...")
-    # This will use the session file automatically - NO INPUT NEEDED
     await user.start()
     user_me = await user.get_me()
     print(f"   ✅ User: {user_me.first_name}")
     
-    # Register handlers
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(event):
         if event.is_private:
             await event.respond(
-                "🚀 **OPTIMIZED VIDEO DOWNLOADER BOT**\n\n"
+                "🚀 **SEQUENTIAL VIDEO DOWNLOADER BOT**\n\n"
                 "**⚡ Features:**\n"
-                f"• Parallel downloads: {MAX_PARALLEL_DOWNLOADS} files at once\n"
+                "• Sequential processing (one by one)\n"
+                "• No timeout limits\n"
+                "• Send multiple links at once\n"
                 "• Real-time progress for each file\n"
                 "• Download speed & ETA tracking\n"
-                "• Automatic retry on failures\n"
-                "• Batch summary statistics\n\n"
+                "• Automatic retry on failures\n\n"
                 "**📋 How to use:**\n"
                 "1. Send one or more Telegram video links\n"
-                "2. Each file gets its own progress tracker\n"
-                "3. Files download in parallel for speed\n"
+                "   (You can paste multiple links at once)\n"
+                "2. Files will be processed one after another\n"
+                "3. Each file gets its own progress tracker\n"
                 "4. Get detailed completion summary\n\n"
-                "**🔗 Supported formats:**\n"
+                "**📗 Supported formats:**\n"
                 "• t.me/channel/123\n"
                 "• https://t.me/c/123/456\n\n"
-                "**💡 Commands:**\n"
+                "**💡 Pro tip:**\n"
+                "Send all your links at once! The bot will queue them\n"
+                "and process each one automatically. No need to wait!\n\n"
+                "**🔧 Commands:**\n"
                 "/start - Show this help\n"
                 "/stats - Show bot statistics"
             )
@@ -418,12 +423,12 @@ async def main():
         if event.is_private:
             await event.respond(
                 f"📊 **Bot Statistics**\n\n"
-                f"⚡ Max parallel downloads: {MAX_PARALLEL_DOWNLOADS}\n"
-                f"🔄 Connection retries: {CONNECTION_RETRIES}\n"
-                f"📡 Progress update interval: {PROGRESS_UPDATE_INTERVAL}s\n"
-                f"⏱️ Batch status update: {BATCH_STATUS_UPDATE_INTERVAL}s\n\n"
+                f"🔄 Processing mode: Sequential (one by one)\n"
+                f"📡 Connection retries: {CONNECTION_RETRIES}\n"
+                f"⏱️ Progress update interval: {PROGRESS_UPDATE_INTERVAL}s\n"
+                f"⏰ No timeout limits\n\n"
                 f"🤖 Status: ✅ Running\n"
-                f"👥 Active users: {len([v for v in user_processing.values() if v])}"
+                f"👥 Active queues: {len([v for v in user_queue.values() if v])}"
             )
     
     @bot.on(events.NewMessage)
@@ -436,7 +441,8 @@ async def main():
     print("="*70)
     print(f"\n📱 Bot: @{bot_me.username}")
     print(f"👤 User: {user_me.first_name}")
-    print(f"⚡ Parallel downloads: {MAX_PARALLEL_DOWNLOADS}")
+    print(f"🔄 Mode: Sequential (one by one)")
+    print(f"⏰ No timeout limits")
     print(f"\n⏳ Press Ctrl+C to stop\n")
     
     try:
