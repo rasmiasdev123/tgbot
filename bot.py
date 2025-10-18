@@ -17,7 +17,7 @@ print("🚀 TELEGRAM VIDEO DOWNLOADER BOT - SEQUENTIAL MODE")
 print("="*70)
 
 # ============ CONFIGURATION ============
-API_ID = 5041713  # Changed from string to integer
+API_ID = 5041713
 API_HASH = '9c27474d00a8b8236307692d4b6f0434'
 BOT_TOKEN = '8477203017:AAHarKtQkBdnfMR7DidTCd6tvE0ziAu0wFc'
 PHONE = '+917540892472'
@@ -34,6 +34,7 @@ CONNECTION_RETRIES = 3
 
 # Track processing - allow queue
 user_queue = {}
+user_stop_flag = {}  # Flag to stop ongoing downloads
 
 # ============ GOOGLE DRIVE ============
 def get_drive_service():
@@ -70,7 +71,8 @@ def parse_link(text):
             channel_id = parts[0].strip('@')
             msg_id = int(parts[1].split('?')[0])
         return channel_id, msg_id
-    except:
+    except Exception as e:
+        print(f"Parse error: {e}")
         return None, None
 
 # ============ PROGRESS TRACKER ============
@@ -118,40 +120,52 @@ class DownloadProgress:
                     f"**Speed:** {speed:.2f} MB/s\n"
                     f"**ETA:** {eta_str}\n\n"
                 )
-            except:
-                pass
+            except Exception as e:
+                print(f"Progress update error: {e}")
 
 # ============ SINGLE FILE PROCESSOR ============
-async def process_single_file(event, user_client, link_text, idx, total, batch_summary_msg=None):
+async def process_single_file(bot_client, user_client, chat_id, link_text, idx, total, batch_summary_msg=None):
+    """Process a single file download"""
     file_name = "Unknown"
     status_msg = None
     
     try:
-        status_msg = await event.respond(f"📍 [{idx}/{total}] Initializing...")
+        # Send status message using bot client
+        status_msg = await bot_client.send_message(chat_id, f"📍 [{idx}/{total}] Initializing...")
         
+        # Parse link
         channel_id, msg_id = parse_link(link_text)
         if not channel_id:
             await status_msg.edit(f"❌ [{idx}/{total}] Invalid link format")
             return {'success': False, 'error': 'Invalid link', 'file_name': f'Link {idx}', 'link': link_text}
         
+        print(f"[{idx}/{total}] Processing: channel={channel_id}, msg={msg_id}")
+        
         await status_msg.edit(f"🔍 [{idx}/{total}] Fetching message...")
+        
+        # Fetch message using user client
         try:
             message = await user_client.get_messages(channel_id, ids=msg_id)
+            print(f"[{idx}/{total}] Message fetched: {type(message)}")
         except Exception as e:
             error_msg = str(e)
-            await status_msg.edit(f"❌ [{idx}/{total}] Error: {error_msg[:30]}")
+            print(f"[{idx}/{total}] Fetch error: {error_msg}")
+            await status_msg.edit(f"❌ [{idx}/{total}] Access error: {error_msg[:30]}")
             return {'success': False, 'error': error_msg[:50], 'file_name': f'Link {idx}', 'link': link_text}
         
         if not message or not message.media:
             await status_msg.edit(f"❌ [{idx}/{total}] No media found")
             return {'success': False, 'error': 'No media', 'file_name': f'Link {idx}', 'link': link_text}
         
+        # Get file name
         file_name = f"video_{msg_id}"
         if hasattr(message.media, 'document'):
             for attr in message.media.document.attributes:
                 if hasattr(attr, 'file_name'):
                     file_name = attr.file_name
                     break
+        
+        print(f"[{idx}/{total}] File name: {file_name}")
         
         # Update batch summary if exists
         if batch_summary_msg:
@@ -162,35 +176,41 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
                     f"📄 `{file_name[:40]}`\n\n"
                     f"⏳ Remaining: {total - idx} files"
                 )
-            except:
-                pass
+            except Exception as e:
+                print(f"Batch msg update error: {e}")
         
+        # Start download
         progress = DownloadProgress(file_name, status_msg, idx, total)
         await status_msg.edit(f"📥 [{idx}/{total}] Starting download...\n📄 `{file_name[:40]}`")
         
         file_path = None
         for attempt in range(CONNECTION_RETRIES):
             try:
+                print(f"[{idx}/{total}] Download attempt {attempt + 1}/{CONNECTION_RETRIES}")
                 file_path = await user_client.download_media(
                     message.media,
                     file=DOWNLOAD_DIR,
                     progress_callback=progress.update
                 )
                 if file_path:
+                    print(f"[{idx}/{total}] Downloaded to: {file_path}")
                     break
             except Exception as e:
+                print(f"[{idx}/{total}] Download error (attempt {attempt + 1}): {e}")
                 if attempt == CONNECTION_RETRIES - 1:
                     await status_msg.edit(f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`\nError: {str(e)[:30]}")
                     return {'success': False, 'error': str(e)[:50], 'file_name': file_name, 'link': link_text}
                 await status_msg.edit(f"⚠️ [{idx}/{total}] Retrying... ({attempt+2}/{CONNECTION_RETRIES})")
                 await asyncio.sleep(2 ** attempt)
         
-        if not file_path:
+        if not file_path or not os.path.exists(file_path):
             await status_msg.edit(f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`")
             return {'success': False, 'error': 'Download failed', 'file_name': file_name, 'link': link_text}
         
         actual_file_name = os.path.basename(file_path)
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        
+        print(f"[{idx}/{total}] File downloaded: {actual_file_name} ({file_size_mb:.1f} MB)")
         
         await status_msg.edit(
             f"☁️ [{idx}/{total}] Uploading to Drive...\n\n"
@@ -200,10 +220,12 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
         
         upload_success = await upload_to_drive_async(file_path, actual_file_name)
         
+        # Cleanup
         try:
             os.remove(file_path)
-        except:
-            pass
+            print(f"[{idx}/{total}] File cleaned up")
+        except Exception as e:
+            print(f"[{idx}/{total}] Cleanup error: {e}")
         
         if upload_success:
             await status_msg.edit(
@@ -218,6 +240,7 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
             return {'success': False, 'error': 'Upload failed', 'file_name': actual_file_name}
     
     except Exception as e:
+        print(f"[{idx}/{total}] Unexpected error: {e}")
         if status_msg:
             try:
                 await status_msg.edit(f"❌ [{idx}/{total}] Error: {str(e)[:50]}")
@@ -226,12 +249,17 @@ async def process_single_file(event, user_client, link_text, idx, total, batch_s
         return {'success': False, 'error': str(e)[:50], 'file_name': file_name}
 
 # ============ SEQUENTIAL BATCH PROCESSOR ============
-async def process_sequential_batch(event, user_client, links):
-    user_id = event.sender_id
+async def process_sequential_batch(bot_client, user_client, chat_id, links):
+    """Process multiple links sequentially"""
     total = len(links)
     start_time = time.time()
     
-    batch_msg = await event.respond(
+    print(f"\n{'='*50}")
+    print(f"Starting batch: {total} files for chat {chat_id}")
+    print(f"{'='*50}\n")
+    
+    batch_msg = await bot_client.send_message(
+        chat_id,
         f"📦 **BATCH QUEUED**\n\n"
         f"📊 Total files: {total}\n"
         f"🔄 Processing mode: Sequential (one by one)\n"
@@ -245,13 +273,16 @@ async def process_sequential_batch(event, user_client, links):
     
     # Process each link one by one
     for idx, link in enumerate(links, 1):
-        result = await process_single_file(event, user_client, link, idx, total, batch_msg)
+        print(f"\n--- Processing file {idx}/{total} ---")
+        result = await process_single_file(bot_client, user_client, chat_id, link, idx, total, batch_msg)
         results.append(result)
         
         if result and result.get('success'):
             completed_count += 1
+            print(f"✅ File {idx}/{total} completed")
         else:
             failed_count += 1
+            print(f"❌ File {idx}/{total} failed: {result.get('error', 'Unknown')}")
         
         # Update batch status after each file
         try:
@@ -265,8 +296,8 @@ async def process_sequential_batch(event, user_client, links):
                 f"❌ Failed: {failed_count}\n"
                 f"⏳ Remaining: {total - idx}"
             )
-        except:
-            pass
+        except Exception as e:
+            print(f"Batch status update error: {e}")
     
     # Final summary
     total_time = int(time.time() - start_time)
@@ -302,13 +333,18 @@ async def process_sequential_batch(event, user_client, links):
     
     await batch_msg.edit(summary)
     
-    if user_id in user_queue:
-        del user_queue[user_id]
+    print(f"\n{'='*50}")
+    print(f"Batch completed: {len(completed)} success, {len(failed)} failed")
+    print(f"{'='*50}\n")
 
 # ============ MESSAGE HANDLER ============
-async def handle_message(event, user_client):
+async def handle_message(event, bot_client, user_client):
+    """Handle incoming messages"""
     user_id = event.sender_id
+    chat_id = event.chat_id
     text = event.raw_text
+    
+    print(f"\nReceived message from user {user_id} in chat {chat_id}")
     
     # Check if user already has a queue
     if user_id in user_queue and user_queue[user_id]:
@@ -323,11 +359,14 @@ async def handle_message(event, user_client):
     try:
         user_queue[user_id] = True
         
+        # Extract links
         links = []
         for line in text.split('\n'):
             line = line.strip()
             if 't.me/' in line or 'telegram.me/' in line:
                 links.append(line)
+        
+        print(f"Found {len(links)} links")
         
         if not links:
             await event.respond(
@@ -343,19 +382,24 @@ async def handle_message(event, user_client):
             return
         
         if len(links) == 1:
-            result = await process_single_file(event, user_client, links[0], 1, 1)
+            print("Processing single link")
+            result = await process_single_file(bot_client, user_client, chat_id, links[0], 1, 1)
             if user_id in user_queue:
                 del user_queue[user_id]
         else:
+            print(f"Processing batch of {len(links)} links")
             await event.respond(
                 f"📝 **Received {len(links)} links**\n\n"
                 f"🔄 Processing sequentially (one by one)\n"
                 f"⏳ No need to wait - all will be processed automatically\n\n"
                 f"You'll get individual updates for each file!"
             )
-            await process_sequential_batch(event, user_client, links)
+            await process_sequential_batch(bot_client, user_client, chat_id, links)
+            if user_id in user_queue:
+                del user_queue[user_id]
     
     except Exception as e:
+        print(f"Handler error: {e}")
         await event.respond(f"❌ Unexpected error: {str(e)}")
         if user_id in user_queue:
             del user_queue[user_id]
@@ -370,7 +414,7 @@ async def main():
         print("\n❌ token.pickle not found!")
         return
     
-    # Initialize clients with proper types
+    # Initialize clients
     print("\n📱 Creating bot client...")
     bot = TelegramClient('bot', API_ID, API_HASH)
     
@@ -385,36 +429,28 @@ async def main():
         
         print("\n🔐 Starting user authentication...")
         
-        # Check if session exists
         if os.path.exists('user.session'):
-            print("   📂 Session file found, attempting to connect...")
+            print("   📂 Session file found, connecting...")
             await user.connect()
             
             if not await user.is_user_authorized():
                 print("   ⚠️  Session expired or invalid")
-                print("   🔄 Please delete user.session and regenerate it")
                 return
             else:
                 print("   ✅ Session valid, authorizing...")
-                # Authorize using the session
                 await user.start(phone=PHONE)
         else:
             print("   ⚠️  No session file found")
-            print("   🔄 Starting interactive login...")
             await user.start(phone=PHONE)
         
         user_me = await user.get_me()
-        print(f"   ✅ User: {user_me.first_name} (@{user_me.username or 'No username'})")
+        print(f"   ✅ User: {user_me.first_name}")
         
     except Exception as e:
         print(f"\n❌ Authentication failed: {e}")
-        print("\n🔧 Troubleshooting steps:")
-        print("1. Delete user.session file if it exists")
-        print("2. Make sure API_ID and API_HASH are correct")
-        print("3. Check phone number format (+917540892472)")
-        print("4. Regenerate session file if needed")
         return
     
+    # Register handlers
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(event):
         if event.is_private:
@@ -460,7 +496,7 @@ async def main():
     @bot.on(events.NewMessage)
     async def message_cmd(event):
         if event.is_private and not event.raw_text.startswith('/'):
-            await handle_message(event, user)
+            await handle_message(event, bot, user)
     
     print("\n" + "="*70)
     print("✅ BOT IS RUNNING!")
@@ -472,16 +508,4 @@ async def main():
     print(f"\n⏳ Press Ctrl+C to stop\n")
     
     try:
-        await bot.run_until_disconnected()
-    except KeyboardInterrupt:
-        print("\n👋 Stopping...")
-    finally:
-        await bot.disconnect()
-        await user.disconnect()
-        print("✅ Stopped")
-
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n👋 Goodbye!")
+        
