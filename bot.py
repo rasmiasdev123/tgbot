@@ -29,12 +29,15 @@ DOWNLOAD_DIR = 'downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Performance settings
-PROGRESS_UPDATE_INTERVAL = 3
+PROGRESS_UPDATE_INTERVAL = 5  # Increased to reduce API calls
 CONNECTION_RETRIES = 3
+BATCH_STATUS_UPDATE_INTERVAL = 10  # Only update batch status every 10 seconds
+MESSAGE_DELAY = 0.5  # Delay between messages to avoid flood
 
 # Track processing - allow queue
 user_queue = {}
 user_tasks = {}  # Store running tasks for each user
+last_message_time = {}  # Track last message time per user
 
 # ============ GOOGLE DRIVE ============
 def get_drive_service():
@@ -57,6 +60,42 @@ def upload_to_drive_sync(file_path, file_name):
     except Exception as e:
         print(f"Upload error: {e}")
         return False
+
+# ============ RATE LIMITER ============
+async def safe_send_message(bot_client, chat_id, text, user_id=None):
+    """Send message with rate limiting"""
+    if user_id:
+        now = time.time()
+        last_time = last_message_time.get(user_id, 0)
+        wait_time = MESSAGE_DELAY - (now - last_time)
+        if wait_time > 0:
+            await asyncio.sleep(wait_time)
+        last_message_time[user_id] = time.time()
+    
+    try:
+        return await bot_client.send_message(chat_id, text)
+    except Exception as e:
+        if "wait" in str(e).lower():
+            # Extract wait time and wait
+            import re
+            match = re.search(r'(\d+) seconds', str(e))
+            if match:
+                wait = int(match.group(1))
+                print(f"Rate limited, waiting {wait}s")
+                await asyncio.sleep(wait + 1)
+                return await bot_client.send_message(chat_id, text)
+        raise
+
+async def safe_edit_message(message, text):
+    """Edit message with rate limiting"""
+    try:
+        return await message.edit(text)
+    except Exception as e:
+        if "wait" in str(e).lower():
+            # Silently ignore rate limit on edits
+            print(f"Rate limit on edit, skipping")
+            return None
+        raise
 
 # ============ LINK PARSER ============
 def parse_link(text):
@@ -94,9 +133,10 @@ class DownloadProgress:
         percent = (current / total) * 100 if total > 0 else 0
         now = time.time()
         
+        # Less frequent updates to avoid rate limits
         if (now - self.last_update >= PROGRESS_UPDATE_INTERVAL or 
             percent >= 99.9 or 
-            percent - self.last_percent >= 10):
+            percent - self.last_percent >= 20):  # Only update every 20%
             
             self.last_update = now
             self.last_percent = percent
@@ -112,7 +152,8 @@ class DownloadProgress:
                 eta_str = "calculating..."
             
             try:
-                await self.message.edit(
+                await safe_edit_message(
+                    self.message,
                     f"📥 **Downloading [{self.idx}/{self.total}]**\n\n"
                     f"📄 `{self.file_name[:40]}{'...' if len(self.file_name) > 40 else ''}`\n\n"
                     f"**Progress:** {percent:.1f}%\n"
@@ -124,24 +165,25 @@ class DownloadProgress:
                 print(f"Progress update error: {e}")
 
 # ============ SINGLE FILE PROCESSOR ============
-async def process_single_file(bot_client, user_client, chat_id, link_text, idx, total, batch_summary_msg=None):
+async def process_single_file(bot_client, user_client, chat_id, link_text, idx, total, batch_summary_msg=None, user_id=None):
     """Process a single file download"""
     file_name = "Unknown"
     status_msg = None
     
     try:
-        # Send status message using bot client
-        status_msg = await bot_client.send_message(chat_id, f"📍 [{idx}/{total}] Initializing...")
+        # Send status message with rate limiting
+        status_msg = await safe_send_message(bot_client, chat_id, f"📍 [{idx}/{total}] Initializing...", user_id)
+        await asyncio.sleep(0.3)  # Small delay between operations
         
         # Parse link
         channel_id, msg_id = parse_link(link_text)
         if not channel_id:
-            await status_msg.edit(f"❌ [{idx}/{total}] Invalid link format")
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Invalid link format")
             return {'success': False, 'error': 'Invalid link', 'file_name': f'Link {idx}', 'link': link_text}
         
         print(f"[{idx}/{total}] Processing: channel={channel_id}, msg={msg_id}")
         
-        await status_msg.edit(f"🔍 [{idx}/{total}] Fetching message...")
+        await safe_edit_message(status_msg, f"🔍 [{idx}/{total}] Fetching message...")
         
         # Fetch message using user client
         try:
@@ -150,11 +192,11 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
         except Exception as e:
             error_msg = str(e)
             print(f"[{idx}/{total}] Fetch error: {error_msg}")
-            await status_msg.edit(f"❌ [{idx}/{total}] Access error: {error_msg[:30]}")
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Access error: {error_msg[:30]}")
             return {'success': False, 'error': error_msg[:50], 'file_name': f'Link {idx}', 'link': link_text}
         
         if not message or not message.media:
-            await status_msg.edit(f"❌ [{idx}/{total}] No media found")
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] No media found")
             return {'success': False, 'error': 'No media', 'file_name': f'Link {idx}', 'link': link_text}
         
         # Get file name
@@ -167,21 +209,12 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
         
         print(f"[{idx}/{total}] File name: {file_name}")
         
-        # Update batch summary if exists
-        if batch_summary_msg:
-            try:
-                await batch_summary_msg.edit(
-                    f"📦 **PROCESSING QUEUE**\n\n"
-                    f"🔄 Currently downloading: [{idx}/{total}]\n"
-                    f"📄 `{file_name[:40]}`\n\n"
-                    f"⏳ Remaining: {total - idx} files"
-                )
-            except Exception as e:
-                print(f"Batch msg update error: {e}")
+        # DON'T update batch summary - causes too many edits
+        # Just update status message
         
         # Start download
         progress = DownloadProgress(file_name, status_msg, idx, total)
-        await status_msg.edit(f"📥 [{idx}/{total}] Starting download...\n📄 `{file_name[:40]}`")
+        await safe_edit_message(status_msg, f"📥 [{idx}/{total}] Starting download...\n📄 `{file_name[:40]}`")
         
         file_path = None
         for attempt in range(CONNECTION_RETRIES):
@@ -198,13 +231,13 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
             except Exception as e:
                 print(f"[{idx}/{total}] Download error (attempt {attempt + 1}): {e}")
                 if attempt == CONNECTION_RETRIES - 1:
-                    await status_msg.edit(f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`\nError: {str(e)[:30]}")
+                    await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`\nError: {str(e)[:30]}")
                     return {'success': False, 'error': str(e)[:50], 'file_name': file_name, 'link': link_text}
-                await status_msg.edit(f"⚠️ [{idx}/{total}] Retrying... ({attempt+2}/{CONNECTION_RETRIES})")
+                await safe_edit_message(status_msg, f"⚠️ [{idx}/{total}] Retrying... ({attempt+2}/{CONNECTION_RETRIES})")
                 await asyncio.sleep(2 ** attempt)
         
         if not file_path or not os.path.exists(file_path):
-            await status_msg.edit(f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`")
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`")
             return {'success': False, 'error': 'Download failed', 'file_name': file_name, 'link': link_text}
         
         actual_file_name = os.path.basename(file_path)
@@ -212,7 +245,8 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
         
         print(f"[{idx}/{total}] File downloaded: {actual_file_name} ({file_size_mb:.1f} MB)")
         
-        await status_msg.edit(
+        await safe_edit_message(
+            status_msg,
             f"☁️ [{idx}/{total}] Uploading to Drive...\n\n"
             f"📄 `{actual_file_name[:40]}`\n"
             f"📦 Size: {file_size_mb:.1f} MB"
@@ -228,7 +262,8 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
             print(f"[{idx}/{total}] Cleanup error: {e}")
         
         if upload_success:
-            await status_msg.edit(
+            await safe_edit_message(
+                status_msg,
                 f"✅ [{idx}/{total}] **COMPLETED**\n\n"
                 f"📄 `{actual_file_name[:40]}`\n"
                 f"📦 {file_size_mb:.1f} MB\n"
@@ -236,23 +271,24 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
             )
             return {'success': True, 'file_name': actual_file_name, 'size': file_size_mb}
         else:
-            await status_msg.edit(f"❌ [{idx}/{total}] Upload failed\n📄 `{actual_file_name}`")
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Upload failed\n📄 `{actual_file_name}`")
             return {'success': False, 'error': 'Upload failed', 'file_name': actual_file_name}
     
     except Exception as e:
         print(f"[{idx}/{total}] Unexpected error: {e}")
         if status_msg:
             try:
-                await status_msg.edit(f"❌ [{idx}/{total}] Error: {str(e)[:50]}")
+                await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Error: {str(e)[:50]}")
             except:
                 pass
         return {'success': False, 'error': str(e)[:50], 'file_name': file_name}
 
 # ============ SEQUENTIAL BATCH PROCESSOR ============
-async def process_sequential_batch(bot_client, user_client, chat_id, links):
+async def process_sequential_batch(bot_client, user_client, chat_id, links, user_id):
     """Process multiple links sequentially"""
     total = len(links)
     start_time = time.time()
+    cancelled = False
     
     print(f"\n{'='*50}")
     print(f"Starting batch: {total} files for chat {chat_id}")
@@ -264,7 +300,8 @@ async def process_sequential_batch(bot_client, user_client, chat_id, links):
         f"📊 Total files: {total}\n"
         f"🔄 Processing mode: Sequential (one by one)\n"
         f"📍 Status: Starting...\n\n"
-        f"⏳ All files will be processed automatically"
+        f"⏳ All files will be processed automatically\n"
+        f"💡 Use /clear to cancel this batch"
     )
     
     results = []
@@ -273,6 +310,12 @@ async def process_sequential_batch(bot_client, user_client, chat_id, links):
     
     # Process each link one by one
     for idx, link in enumerate(links, 1):
+        # Check if cancelled
+        if user_id in user_queue and not user_queue[user_id]:
+            cancelled = True
+            print(f"\n❌ Batch cancelled by user at file {idx}/{total}")
+            break
+            
         print(f"\n--- Processing file {idx}/{total} ---")
         result = await process_single_file(bot_client, user_client, chat_id, link, idx, total, batch_msg)
         results.append(result)
@@ -305,16 +348,26 @@ async def process_sequential_batch(bot_client, user_client, chat_id, links):
     failed = [r for r in results if not isinstance(r, dict) or not r.get('success')]
     total_size = sum(r.get('size', 0) for r in completed)
     
-    summary = f"🎉 **ALL FILES PROCESSED!**\n\n"
-    summary += f"📊 **Statistics:**\n"
-    summary += f"Total files: {total}\n"
-    summary += f"✅ Successful: {len(completed)}\n"
-    summary += f"❌ Failed: {len(failed)}\n"
-    summary += f"📦 Total size: {total_size:.1f} MB\n"
-    summary += f"⏱️ Total time: {total_time//60}m {total_time%60}s\n"
-    if total_size > 0 and total_time > 0:
-        summary += f"⚡ Avg speed: {total_size/total_time:.2f} MB/s\n"
-    summary += "\n"
+    if cancelled:
+        summary = f"🛑 **BATCH CANCELLED**\n\n"
+        summary += f"📊 **Statistics:**\n"
+        summary += f"Total files: {total}\n"
+        summary += f"✅ Completed before cancel: {len(completed)}\n"
+        summary += f"❌ Failed: {len(failed)}\n"
+        summary += f"⏭️ Skipped: {total - len(results)}\n"
+        summary += f"📦 Downloaded: {total_size:.1f} MB\n"
+        summary += f"⏱️ Time: {total_time//60}m {total_time%60}s\n"
+    else:
+        summary = f"🎉 **ALL FILES PROCESSED!**\n\n"
+        summary += f"📊 **Statistics:**\n"
+        summary += f"Total files: {total}\n"
+        summary += f"✅ Successful: {len(completed)}\n"
+        summary += f"❌ Failed: {len(failed)}\n"
+        summary += f"📦 Total size: {total_size:.1f} MB\n"
+        summary += f"⏱️ Total time: {total_time//60}m {total_time%60}s\n"
+        if total_size > 0 and total_time > 0:
+            summary += f"⚡ Avg speed: {total_size/total_time:.2f} MB/s\n"
+        summary += "\n"
     
     if completed:
         summary += f"**✅ Completed Files ({len(completed)}):**\n"
@@ -331,10 +384,29 @@ async def process_sequential_batch(bot_client, user_client, chat_id, links):
         if len(failed) > 10:
             summary += f"• ... and {len(failed)-10} more\n"
     
-    await batch_msg.edit(summary)
+    await safe_edit_message(batch_msg, summary)
+    
+    # Cleanup downloads directory
+    try:
+        for file in os.listdir(DOWNLOAD_DIR):
+            file_path = os.path.join(DOWNLOAD_DIR, file)
+            if os.path.isfile(file_path):
+                os.remove(file_path)
+        print("✅ Downloads directory cleaned")
+    except Exception as e:
+        print(f"Cleanup error: {e}")
+    
+    # Remove from queue and tasks
+    if user_id in user_queue:
+        del user_queue[user_id]
+    if user_id in user_tasks:
+        del user_tasks[user_id]
     
     print(f"\n{'='*50}")
-    print(f"Batch completed: {len(completed)} success, {len(failed)} failed")
+    if cancelled:
+        print(f"Batch cancelled: {len(completed)} completed, {total - len(results)} skipped")
+    else:
+        print(f"Batch completed: {len(completed)} success, {len(failed)} failed")
     print(f"{'='*50}\n")
 
 # ============ MESSAGE HANDLER ============
@@ -383,7 +455,7 @@ async def handle_message(event, bot_client, user_client):
         
         if len(links) == 1:
             print("Processing single link")
-            result = await process_single_file(bot_client, user_client, chat_id, links[0], 1, 1)
+            result = await process_single_file(bot_client, user_client, chat_id, links[0], 1, 1, None, user_id)
             if user_id in user_queue:
                 del user_queue[user_id]
         else:
@@ -392,11 +464,13 @@ async def handle_message(event, bot_client, user_client):
                 f"📝 **Received {len(links)} links**\n\n"
                 f"🔄 Processing sequentially (one by one)\n"
                 f"⏳ No need to wait - all will be processed automatically\n\n"
-                f"You'll get individual updates for each file!"
+                f"You'll get individual updates for each file!\n"
+                f"💡 Use /clear to cancel anytime"
             )
-            await process_sequential_batch(bot_client, user_client, chat_id, links)
-            if user_id in user_queue:
-                del user_queue[user_id]
+            # Store task for cancellation
+            task = asyncio.create_task(process_sequential_batch(bot_client, user_client, chat_id, links, user_id))
+            user_tasks[user_id] = task
+            await task
     
     except Exception as e:
         print(f"Handler error: {e}")
@@ -477,8 +551,42 @@ async def main():
                 "and process each one automatically. No need to wait!\n\n"
                 "**🔧 Commands:**\n"
                 "/start - Show this help\n"
-                "/stats - Show bot statistics"
+                "/stats - Show bot statistics\n"
+                "/clear - Cancel current batch and clear queue"
             )
+    
+    @bot.on(events.NewMessage(pattern='/clear'))
+    async def clear_cmd(event):
+        if event.is_private:
+            user_id = event.sender_id
+            
+            if user_id not in user_queue or not user_queue[user_id]:
+                await event.respond("ℹ️ No active downloads to clear")
+                return
+            
+            # Mark as cancelled
+            user_queue[user_id] = False
+            
+            # Clean up downloads directory
+            try:
+                cleaned = 0
+                for file in os.listdir(DOWNLOAD_DIR):
+                    file_path = os.path.join(DOWNLOAD_DIR, file)
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        cleaned += 1
+                
+                await event.respond(
+                    f"🛑 **CLEARING QUEUE**\n\n"
+                    f"✅ Cancellation signal sent\n"
+                    f"🧹 Cleaned {cleaned} pending files\n\n"
+                    f"Current download will complete, then batch will stop.\n"
+                    f"You can send new links now!"
+                )
+                print(f"User {user_id} cleared queue - cleaned {cleaned} files")
+            except Exception as e:
+                await event.respond(f"⚠️ Queue cleared but cleanup error: {str(e)}")
+                print(f"Clear error: {e}")
     
     @bot.on(events.NewMessage(pattern='/stats'))
     async def stats_cmd(event):
