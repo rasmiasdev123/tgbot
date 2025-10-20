@@ -24,9 +24,21 @@ PHONE = '+917540892472'
 
 # Settings
 DRIVE_FOLDER_ID = '1e1KS9b8iqNMMX4c3nlJvrUCaO2sO5ANO'
+FOLDER_ID_FILE = 'folder_id.txt'  # Store custom folder ID
 TOKEN_PICKLE = 'token.pickle'
 DOWNLOAD_DIR = 'downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Load custom folder ID if exists
+if os.path.exists(FOLDER_ID_FILE):
+    try:
+        with open(FOLDER_ID_FILE, 'r') as f:
+            custom_id = f.read().strip()
+            if custom_id:
+                DRIVE_FOLDER_ID = custom_id
+                print(f"📁 Using custom folder ID: {DRIVE_FOLDER_ID}")
+    except:
+        pass
 
 # Performance settings
 PROGRESS_UPDATE_INTERVAL = 5  # Increased to reduce API calls
@@ -50,6 +62,7 @@ async def upload_to_drive_async(file_path, file_name):
     return await loop.run_in_executor(None, upload_to_drive_sync, file_path, file_name)
 
 def upload_to_drive_sync(file_path, file_name):
+    global DRIVE_FOLDER_ID
     try:
         service = get_drive_service()
         file_metadata = {'name': file_name, 'parents': [DRIVE_FOLDER_ID]}
@@ -587,6 +600,63 @@ async def main():
             except Exception as e:
                 await event.respond(f"⚠️ Queue cleared but cleanup error: {str(e)}")
                 print(f"Clear error: {e}")
+    
+    @bot.on(events.NewMessage(pattern='/folder'))
+    async def folder_cmd(event):
+        if event.is_private:
+            global DRIVE_FOLDER_ID
+            
+            # Get text after command
+            text = event.raw_text.strip()
+            
+            if text == '/folder':
+                # Show current folder ID
+                await event.respond(
+                    f"📁 **Current Google Drive Folder**\n\n"
+                    f"**Folder ID:** `{DRIVE_FOLDER_ID}`\n\n"
+                    f"**To change folder:**\n"
+                    f"Send: `/folder YOUR_FOLDER_ID`\n\n"
+                    f"**Example:**\n"
+                    f"`/folder 1e1KS9b8iqNMMX4c3nlJvrUCaO2sO5ANO`\n\n"
+                    f"**How to get Folder ID:**\n"
+                    f"1. Open folder in Google Drive\n"
+                    f"2. Copy ID from URL:\n"
+                    f"   `drive.google.com/drive/folders/[FOLDER_ID]`"
+                )
+                return
+            
+            # Extract new folder ID
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2:
+                await event.respond("❌ Please provide a folder ID\n\nUsage: `/folder YOUR_FOLDER_ID`")
+                return
+            
+            new_folder_id = parts[1].strip()
+            
+            # Validate folder ID (basic check)
+            if len(new_folder_id) < 20 or ' ' in new_folder_id:
+                await event.respond("❌ Invalid folder ID format\n\nFolder ID should be a long string without spaces")
+                return
+            
+            # Save to file
+            try:
+                with open(FOLDER_ID_FILE, 'w') as f:
+                    f.write(new_folder_id)
+                
+                old_folder_id = DRIVE_FOLDER_ID
+                DRIVE_FOLDER_ID = new_folder_id
+                
+                await event.respond(
+                    f"✅ **Folder Updated Successfully!**\n\n"
+                    f"**Old Folder ID:**\n`{old_folder_id}`\n\n"
+                    f"**New Folder ID:**\n`{new_folder_id}`\n\n"
+                    f"All new uploads will go to the new folder.\n"
+                    f"Change persists across bot restarts!"
+                )
+                print(f"Folder ID changed from {old_folder_id} to {new_folder_id}")
+            except Exception as e:
+                await event.respond(f"❌ Failed to save folder ID: {str(e)}")
+                print(f"Folder save error: {e}")
     
     @bot.on(events.NewMessage(pattern='/stats'))
     async def stats_cmd(event):
