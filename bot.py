@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
 Sequential Telegram Video Downloader Bot
-Processes multiple links one after another - no timeouts
+Fixed media fetching for private channels
 """
 import os
 import asyncio
 import time
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, ChannelPrivateError
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import pickle
 
 print("="*70)
-print("🚀 TELEGRAM VIDEO DOWNLOADER BOT - SEQUENTIAL MODE")
+print("🚀 TELEGRAM VIDEO DOWNLOADER BOT - SEQUENTIAL MODE (FIXED)")
 print("="*70)
 
 # ============ CONFIGURATION ============
@@ -24,7 +24,7 @@ PHONE = '+917540892472'
 
 # Settings
 DRIVE_FOLDER_ID = '1e1KS9b8iqNMMX4c3nlJvrUCaO2sO5ANO'
-FOLDER_ID_FILE = 'folder_id.txt'  # Store custom folder ID
+FOLDER_ID_FILE = 'folder_id.txt'
 TOKEN_PICKLE = 'token.pickle'
 DOWNLOAD_DIR = 'downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -41,15 +41,14 @@ if os.path.exists(FOLDER_ID_FILE):
         pass
 
 # Performance settings
-PROGRESS_UPDATE_INTERVAL = 5  # Increased to reduce API calls
+PROGRESS_UPDATE_INTERVAL = 5
 CONNECTION_RETRIES = 3
-BATCH_STATUS_UPDATE_INTERVAL = 10  # Only update batch status every 10 seconds
-MESSAGE_DELAY = 0.5  # Delay between messages to avoid flood
+MESSAGE_DELAY = 0.5
 
-# Track processing - allow queue
+# Track processing
 user_queue = {}
-user_tasks = {}  # Store running tasks for each user
-last_message_time = {}  # Track last message time per user
+user_tasks = {}
+last_message_time = {}
 
 # ============ GOOGLE DRIVE ============
 def get_drive_service():
@@ -76,7 +75,6 @@ def upload_to_drive_sync(file_path, file_name):
 
 # ============ RATE LIMITER ============
 async def safe_send_message(bot_client, chat_id, text, user_id=None):
-    """Send message with rate limiting"""
     if user_id:
         now = time.time()
         last_time = last_message_time.get(user_id, 0)
@@ -89,7 +87,6 @@ async def safe_send_message(bot_client, chat_id, text, user_id=None):
         return await bot_client.send_message(chat_id, text)
     except Exception as e:
         if "wait" in str(e).lower():
-            # Extract wait time and wait
             import re
             match = re.search(r'(\d+) seconds', str(e))
             if match:
@@ -100,32 +97,76 @@ async def safe_send_message(bot_client, chat_id, text, user_id=None):
         raise
 
 async def safe_edit_message(message, text):
-    """Edit message with rate limiting"""
     try:
         return await message.edit(text)
     except Exception as e:
         if "wait" in str(e).lower():
-            # Silently ignore rate limit on edits
             print(f"Rate limit on edit, skipping")
             return None
         raise
 
-# ============ LINK PARSER ============
+# ============ IMPROVED LINK PARSER ============
 def parse_link(text):
+    """Parse Telegram link and return channel_id, topic_id, msg_id, is_private"""
     try:
         text = text.strip()
+        is_private = False
+        topic_id = None
+        
         if '/c/' in text:
+            is_private = True
+            # Format: t.me/c/CHANNEL_ID/TOPIC_ID/MESSAGE_ID or t.me/c/CHANNEL_ID/MESSAGE_ID
             parts = text.split('/c/')[-1].split('/')
             channel_id = int('-100' + parts[0])
-            msg_id = int(parts[1].split('?')[0])
+            
+            if len(parts) >= 3:
+                # Has topic ID
+                topic_id = int(parts[1])
+                msg_id = int(parts[2].split('?')[0])
+            else:
+                # No topic, just message
+                msg_id = int(parts[1].split('?')[0])
         else:
+            # Public channel format: t.me/channel/123 or t.me/channel/topic/123
             parts = text.split('t.me/')[-1].split('/')
-            channel_id = parts[0].strip('@')
-            msg_id = int(parts[1].split('?')[0])
-        return channel_id, msg_id
+            channel_username = parts[0].strip('@')
+            
+            if len(parts) >= 3:
+                topic_id = int(parts[1])
+                msg_id = int(parts[2].split('?')[0])
+            else:
+                msg_id = int(parts[1].split('?')[0])
+            
+            channel_id = channel_username
+        
+        return channel_id, topic_id, msg_id, is_private
     except Exception as e:
         print(f"Parse error: {e}")
-        return None, None
+        return None, None, None, False
+
+# ============ IMPROVED MESSAGE FETCHER ============
+async def fetch_message_from_channel(user_client, channel_id, topic_id, msg_id, is_private):
+    """Fetch message with proper handling for both public and private channels"""
+    try:
+        if is_private:
+            await user_client.get_dialogs()
+            
+            if topic_id:
+                message = await user_client.get_messages(channel_id, ids=msg_id, reply_to=topic_id)
+            else:
+                message = await user_client.get_messages(channel_id, ids=msg_id)
+        else:
+            entity = await user_client.get_entity(channel_id)
+            if topic_id:
+                message = await user_client.get_messages(entity, ids=msg_id, reply_to=topic_id)
+            else:
+                message = await user_client.get_messages(entity, ids=msg_id)
+        
+        return message
+        
+    except Exception as e:
+        print(f"❌ Fetch error: {e}")
+        raise
 
 # ============ PROGRESS TRACKER ============
 class DownloadProgress:
@@ -137,23 +178,16 @@ class DownloadProgress:
         self.last_update = 0
         self.last_percent = 0
         self.start_time = time.time()
-        self.current_bytes = 0
-        self.total_bytes = 0
         
     async def update(self, current, total):
-        self.current_bytes = current
-        self.total_bytes = total
         percent = (current / total) * 100 if total > 0 else 0
         now = time.time()
         
-        # Less frequent updates to avoid rate limits
         if (now - self.last_update >= PROGRESS_UPDATE_INTERVAL or 
-            percent >= 99.9 or 
-            percent - self.last_percent >= 20):  # Only update every 20%
+            percent >= 99.9 or percent - self.last_percent >= 20):
             
             self.last_update = now
             self.last_percent = percent
-            
             time_diff = now - self.start_time
             speed = current / time_diff / (1024 * 1024) if time_diff > 0 else 0
             
@@ -172,60 +206,111 @@ class DownloadProgress:
                     f"**Progress:** {percent:.1f}%\n"
                     f"**Downloaded:** {current/(1024*1024):.1f} MB / {total/(1024*1024):.1f} MB\n"
                     f"**Speed:** {speed:.2f} MB/s\n"
-                    f"**ETA:** {eta_str}\n\n"
+                    f"**ETA:** {eta_str}"
                 )
             except Exception as e:
                 print(f"Progress update error: {e}")
 
-# ============ SINGLE FILE PROCESSOR ============
+# ============ SINGLE FILE PROCESSOR (FIXED) ============
 async def process_single_file(bot_client, user_client, chat_id, link_text, idx, total, batch_summary_msg=None, user_id=None):
-    """Process a single file download"""
     file_name = "Unknown"
     status_msg = None
     
     try:
-        # Send status message with rate limiting
         status_msg = await safe_send_message(bot_client, chat_id, f"📍 [{idx}/{total}] Initializing...", user_id)
-        await asyncio.sleep(0.3)  # Small delay between operations
+        await asyncio.sleep(0.3)
         
-        # Parse link
-        channel_id, msg_id = parse_link(link_text)
+        channel_id, topic_id, msg_id, is_private = parse_link(link_text)
         if not channel_id:
             await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Invalid link format")
-            return {'success': False, 'error': 'Invalid link', 'file_name': f'Link {idx}', 'link': link_text}
+            return {'success': False, 'error': 'Invalid link', 'file_name': f'Link {idx}'}
         
-        print(f"[{idx}/{total}] Processing: channel={channel_id}, msg={msg_id}")
-        
+        print(f"[{idx}/{total}] Processing: channel={channel_id}, topic={topic_id}, msg={msg_id}, private={is_private}")
         await safe_edit_message(status_msg, f"🔍 [{idx}/{total}] Fetching message...")
         
-        # Fetch message using user client
         try:
-            message = await user_client.get_messages(channel_id, ids=msg_id)
-            print(f"[{idx}/{total}] Message fetched: {type(message)}")
+            message = await fetch_message_from_channel(user_client, channel_id, topic_id, msg_id, is_private)
+            print(f"[{idx}/{total}] Message fetched successfully")
         except Exception as e:
             error_msg = str(e)
             print(f"[{idx}/{total}] Fetch error: {error_msg}")
-            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Access error: {error_msg[:30]}")
-            return {'success': False, 'error': error_msg[:50], 'file_name': f'Link {idx}', 'link': link_text}
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] {error_msg[:50]}")
+            return {'success': False, 'error': error_msg[:50], 'file_name': f'Link {idx}'}
         
-        if not message or not message.media:
-            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] No media found")
-            return {'success': False, 'error': 'No media', 'file_name': f'Link {idx}', 'link': link_text}
+        if not message:
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Message not found")
+            return {'success': False, 'error': 'Message not found', 'file_name': f'Link {idx}'}
         
-        # Get file name
-        file_name = f"video_{msg_id}"
-        if hasattr(message.media, 'document'):
+        # Debug: Print message type
+        print(f"[{idx}/{total}] Message type: {type(message).__name__}")
+        
+        # Check if it's a service message (topic creation, etc.)
+        if type(message).__name__ == 'MessageService':
+            print(f"[{idx}/{total}] Service message detected: {message.action}")
+            
+            # The fetch function should have already tried to get media from topic
+            # If we're still here with a service message, no media was found
+            if hasattr(message.action, 'title'):
+                topic_title = message.action.title
+                await safe_edit_message(
+                    status_msg, 
+                    f"❌ [{idx}/{total}] No media found\n\n"
+                    f"This is a topic: '{topic_title}'\n"
+                    f"Searched the topic but found no media files.\n\n"
+                    f"Please check if files exist in this topic."
+                )
+            else:
+                await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Service message, no media")
+            
+            return {'success': False, 'error': 'No media in topic', 'file_name': f'Link {idx}'}
+        
+        # Debug: Print media info
+        print(f"[{idx}/{total}] Has media attr: {hasattr(message, 'media')}")
+        print(f"[{idx}/{total}] Media value: {message.media if hasattr(message, 'media') else 'NO ATTR'}")
+        
+        # Check for any type of media
+        if not hasattr(message, 'media') or message.media is None:
+            await safe_edit_message(
+                status_msg, 
+                f"❌ [{idx}/{total}] No media in message\n\n"
+                f"**Possible reasons:**\n"
+                f"• Wrong message link\n"
+                f"• Message has only text\n"
+                f"• Topic/thread header instead of actual file\n\n"
+                f"Make sure you're linking to a message with an actual file!"
+            )
+            return {'success': False, 'error': 'No media', 'file_name': f'Link {idx}'}
+        
+        # Debug: Print media type and details
+        print(f"[{idx}/{total}] Media type: {type(message.media).__name__}")
+        
+        # Get file name based on media type
+        file_name = f"file_{msg_id}"
+        
+        if hasattr(message.media, 'document') and message.media.document:
+            print(f"[{idx}/{total}] Document detected")
             for attr in message.media.document.attributes:
-                if hasattr(attr, 'file_name'):
+                if hasattr(attr, 'file_name') and attr.file_name:
                     file_name = attr.file_name
+                    print(f"[{idx}/{total}] File name: {file_name}")
                     break
+            # Fallback to mime type
+            if file_name == f"file_{msg_id}" and hasattr(message.media.document, 'mime_type'):
+                mime = message.media.document.mime_type
+                print(f"[{idx}/{total}] MIME type: {mime}")
+                if 'pdf' in mime:
+                    file_name = f"document_{msg_id}.pdf"
+                elif 'video' in mime:
+                    ext = mime.split('/')[-1]
+                    file_name = f"video_{msg_id}.{ext}"
+        elif hasattr(message.media, 'photo'):
+            file_name = f"photo_{msg_id}.jpg"
+            print(f"[{idx}/{total}] Photo detected")
+        else:
+            print(f"[{idx}/{total}] Unknown media type: {type(message.media).__name__}")
         
         print(f"[{idx}/{total}] File name: {file_name}")
         
-        # DON'T update batch summary - causes too many edits
-        # Just update status message
-        
-        # Start download
         progress = DownloadProgress(file_name, status_msg, idx, total)
         await safe_edit_message(status_msg, f"📥 [{idx}/{total}] Starting download...\n📄 `{file_name[:40]}`")
         
@@ -244,18 +329,17 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
             except Exception as e:
                 print(f"[{idx}/{total}] Download error (attempt {attempt + 1}): {e}")
                 if attempt == CONNECTION_RETRIES - 1:
-                    await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`\nError: {str(e)[:30]}")
-                    return {'success': False, 'error': str(e)[:50], 'file_name': file_name, 'link': link_text}
+                    await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Download failed: {str(e)[:30]}")
+                    return {'success': False, 'error': str(e)[:50], 'file_name': file_name}
                 await safe_edit_message(status_msg, f"⚠️ [{idx}/{total}] Retrying... ({attempt+2}/{CONNECTION_RETRIES})")
                 await asyncio.sleep(2 ** attempt)
         
         if not file_path or not os.path.exists(file_path):
-            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Download failed\n📄 `{file_name}`")
-            return {'success': False, 'error': 'Download failed', 'file_name': file_name, 'link': link_text}
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Download failed")
+            return {'success': False, 'error': 'Download failed', 'file_name': file_name}
         
         actual_file_name = os.path.basename(file_path)
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-        
         print(f"[{idx}/{total}] File downloaded: {actual_file_name} ({file_size_mb:.1f} MB)")
         
         await safe_edit_message(
@@ -267,7 +351,6 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
         
         upload_success = await upload_to_drive_async(file_path, actual_file_name)
         
-        # Cleanup
         try:
             os.remove(file_path)
             print(f"[{idx}/{total}] File cleaned up")
@@ -284,11 +367,13 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
             )
             return {'success': True, 'file_name': actual_file_name, 'size': file_size_mb}
         else:
-            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Upload failed\n📄 `{actual_file_name}`")
+            await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Upload failed")
             return {'success': False, 'error': 'Upload failed', 'file_name': actual_file_name}
     
     except Exception as e:
         print(f"[{idx}/{total}] Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
         if status_msg:
             try:
                 await safe_edit_message(status_msg, f"❌ [{idx}/{total}] Error: {str(e)[:50]}")
@@ -298,7 +383,6 @@ async def process_single_file(bot_client, user_client, chat_id, link_text, idx, 
 
 # ============ SEQUENTIAL BATCH PROCESSOR ============
 async def process_sequential_batch(bot_client, user_client, chat_id, links, user_id):
-    """Process multiple links sequentially"""
     total = len(links)
     start_time = time.time()
     cancelled = False
@@ -311,364 +395,347 @@ async def process_sequential_batch(bot_client, user_client, chat_id, links, user
         chat_id,
         f"📦 **BATCH QUEUED**\n\n"
         f"📊 Total files: {total}\n"
-        f"🔄 Processing mode: Sequential (one by one)\n"
+        f"🔄 Processing mode: Sequential\n"
         f"📍 Status: Starting...\n\n"
-        f"⏳ All files will be processed automatically\n"
-        f"💡 Use /clear to cancel this batch"
+        f"💡 Use /clear to cancel"
     )
     
     results = []
     completed_count = 0
     failed_count = 0
     
-    # Process each link one by one
     for idx, link in enumerate(links, 1):
-        # Check if cancelled
         if user_id in user_queue and not user_queue[user_id]:
             cancelled = True
-            print(f"\n❌ Batch cancelled by user at file {idx}/{total}")
+            print(f"\n❌ Batch cancelled at file {idx}/{total}")
             break
             
         print(f"\n--- Processing file {idx}/{total} ---")
-        result = await process_single_file(bot_client, user_client, chat_id, link, idx, total, batch_msg)
+        result = await process_single_file(bot_client, user_client, chat_id, link, idx, total, batch_msg, user_id)
         results.append(result)
         
         if result and result.get('success'):
             completed_count += 1
-            print(f"✅ File {idx}/{total} completed")
         else:
             failed_count += 1
-            print(f"❌ File {idx}/{total} failed: {result.get('error', 'Unknown')}")
         
-        # Update batch status after each file
         try:
             elapsed = int(time.time() - start_time)
             await batch_msg.edit(
-                f"📦 **PROCESSING QUEUE**\n\n"
-                f"📊 Total: {total} files\n"
-                f"⏱️ Elapsed: {elapsed//60}m {elapsed%60}s\n\n"
-                f"Progress: {idx}/{total} ({(idx/total)*100:.1f}%)\n"
-                f"✅ Completed: {completed_count}\n"
+                f"📦 **PROCESSING**\n\n"
+                f"📊 Total: {total}\n"
+                f"⏱️ Time: {elapsed//60}m {elapsed%60}s\n"
+                f"Progress: {idx}/{total} ({(idx/total)*100:.0f}%)\n"
+                f"✅ Done: {completed_count}\n"
                 f"❌ Failed: {failed_count}\n"
-                f"⏳ Remaining: {total - idx}"
+                f"⏳ Left: {total - idx}"
             )
-        except Exception as e:
-            print(f"Batch status update error: {e}")
+        except:
+            pass
     
-    # Final summary
     total_time = int(time.time() - start_time)
     completed = [r for r in results if isinstance(r, dict) and r.get('success')]
     failed = [r for r in results if not isinstance(r, dict) or not r.get('success')]
     total_size = sum(r.get('size', 0) for r in completed)
     
     if cancelled:
-        summary = f"🛑 **BATCH CANCELLED**\n\n"
-        summary += f"📊 **Statistics:**\n"
-        summary += f"Total files: {total}\n"
-        summary += f"✅ Completed before cancel: {len(completed)}\n"
-        summary += f"❌ Failed: {len(failed)}\n"
-        summary += f"⏭️ Skipped: {total - len(results)}\n"
-        summary += f"📦 Downloaded: {total_size:.1f} MB\n"
-        summary += f"⏱️ Time: {total_time//60}m {total_time%60}s\n"
+        summary = f"🛑 **CANCELLED**\n\n"
     else:
-        summary = f"🎉 **ALL FILES PROCESSED!**\n\n"
-        summary += f"📊 **Statistics:**\n"
-        summary += f"Total files: {total}\n"
-        summary += f"✅ Successful: {len(completed)}\n"
-        summary += f"❌ Failed: {len(failed)}\n"
-        summary += f"📦 Total size: {total_size:.1f} MB\n"
-        summary += f"⏱️ Total time: {total_time//60}m {total_time%60}s\n"
-        if total_size > 0 and total_time > 0:
-            summary += f"⚡ Avg speed: {total_size/total_time:.2f} MB/s\n"
-        summary += "\n"
+        summary = f"🎉 **COMPLETED!**\n\n"
+    
+    summary += f"📊 Total: {total}\n"
+    summary += f"✅ Success: {len(completed)}\n"
+    summary += f"❌ Failed: {len(failed)}\n"
+    summary += f"📦 Size: {total_size:.1f} MB\n"
+    summary += f"⏱️ Time: {total_time//60}m {total_time%60}s\n"
     
     if completed:
-        summary += f"**✅ Completed Files ({len(completed)}):**\n"
-        for r in completed[:15]:
-            summary += f"• `{r['file_name'][:40]}` ({r['size']:.1f} MB)\n"
-        if len(completed) > 15:
-            summary += f"• ... and {len(completed)-15} more\n"
+        summary += f"\n**✅ Completed ({len(completed)}):**\n"
+        for r in completed[:10]:
+            summary += f"• `{r['file_name'][:35]}` ({r['size']:.1f}MB)\n"
+        if len(completed) > 10:
+            summary += f"• ... +{len(completed)-10} more\n"
     
     if failed:
         summary += f"\n**❌ Failed ({len(failed)}):**\n"
-        for i, r in enumerate(failed[:10], 1):
+        for r in failed[:5]:
             if isinstance(r, dict):
-                summary += f"• {r.get('file_name', f'File {i}')}: {r.get('error', 'Unknown')}\n"
-        if len(failed) > 10:
-            summary += f"• ... and {len(failed)-10} more\n"
+                summary += f"• {r.get('file_name', 'Unknown')}: {r.get('error', '?')}\n"
+        if len(failed) > 5:
+            summary += f"• ... +{len(failed)-5} more\n"
     
     await safe_edit_message(batch_msg, summary)
     
-    # Cleanup downloads directory
     try:
         for file in os.listdir(DOWNLOAD_DIR):
-            file_path = os.path.join(DOWNLOAD_DIR, file)
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-        print("✅ Downloads directory cleaned")
-    except Exception as e:
-        print(f"Cleanup error: {e}")
+            os.remove(os.path.join(DOWNLOAD_DIR, file))
+    except:
+        pass
     
-    # Remove from queue and tasks
     if user_id in user_queue:
         del user_queue[user_id]
     if user_id in user_tasks:
         del user_tasks[user_id]
-    
-    print(f"\n{'='*50}")
-    if cancelled:
-        print(f"Batch cancelled: {len(completed)} completed, {total - len(results)} skipped")
-    else:
-        print(f"Batch completed: {len(completed)} success, {len(failed)} failed")
-    print(f"{'='*50}\n")
 
 # ============ MESSAGE HANDLER ============
 async def handle_message(event, bot_client, user_client):
-    """Handle incoming messages"""
     user_id = event.sender_id
     chat_id = event.chat_id
     text = event.raw_text
     
-    print(f"\nReceived message from user {user_id} in chat {chat_id}")
-    
-    # Check if user already has a queue
     if user_id in user_queue and user_queue[user_id]:
-        await event.respond(
-            "⚠️ **Already processing your files!**\n\n"
-            "Your links are being processed one by one.\n"
-            "Please wait for completion before sending more.\n\n"
-            "💡 You can send multiple links at once - they'll be processed sequentially."
-        )
+        await event.respond("⚠️ Already processing! Wait for completion.")
         return
     
     try:
         user_queue[user_id] = True
         
-        # Extract links
-        links = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if 't.me/' in line or 'telegram.me/' in line:
-                links.append(line)
-        
-        print(f"Found {len(links)} links")
+        links = [line.strip() for line in text.split('\n') if 't.me/' in line]
         
         if not links:
             await event.respond(
-                "❌ No valid Telegram links found\n\n"
-                "**Supported formats:**\n"
+                "❌ No valid links\n\n"
+                "Formats:\n"
                 "• t.me/channel/123\n"
-                "• https://t.me/c/123/456\n\n"
-                "💡 **Tip:** Send multiple links at once (one per line)\n"
-                "They'll be processed one after another automatically!"
+                "• https://t.me/c/123/456"
             )
-            if user_id in user_queue:
-                del user_queue[user_id]
+            del user_queue[user_id]
             return
         
         if len(links) == 1:
-            print("Processing single link")
-            result = await process_single_file(bot_client, user_client, chat_id, links[0], 1, 1, None, user_id)
-            if user_id in user_queue:
-                del user_queue[user_id]
+            await process_single_file(bot_client, user_client, chat_id, links[0], 1, 1, None, user_id)
+            del user_queue[user_id]
         else:
-            print(f"Processing batch of {len(links)} links")
-            await event.respond(
-                f"📝 **Received {len(links)} links**\n\n"
-                f"🔄 Processing sequentially (one by one)\n"
-                f"⏳ No need to wait - all will be processed automatically\n\n"
-                f"You'll get individual updates for each file!\n"
-                f"💡 Use /clear to cancel anytime"
-            )
-            # Store task for cancellation
+            await event.respond(f"📝 Processing {len(links)} links sequentially...")
             task = asyncio.create_task(process_sequential_batch(bot_client, user_client, chat_id, links, user_id))
             user_tasks[user_id] = task
             await task
     
     except Exception as e:
         print(f"Handler error: {e}")
-        await event.respond(f"❌ Unexpected error: {str(e)}")
+        await event.respond(f"❌ Error: {str(e)}")
         if user_id in user_queue:
             del user_queue[user_id]
 
 # ============ MAIN ============
 async def main():
     print("\n" + "="*70)
-    print("🚀 STARTING BOT - SEQUENTIAL MODE")
+    print("🚀 STARTING BOT (FIXED)")
     print("="*70)
     
     if not os.path.exists(TOKEN_PICKLE):
         print("\n❌ token.pickle not found!")
         return
     
-    # Initialize clients
-    print("\n📱 Creating bot client...")
     bot = TelegramClient('bot', API_ID, API_HASH)
-    
-    print("👤 Creating user client...")
     user = TelegramClient('user', API_ID, API_HASH)
     
     try:
-        print("\n🔐 Starting bot authentication...")
         await bot.start(bot_token=BOT_TOKEN)
         bot_me = await bot.get_me()
-        print(f"   ✅ Bot: @{bot_me.username}")
-        
-        print("\n🔐 Starting user authentication...")
+        print(f"✅ Bot: @{bot_me.username}")
         
         if os.path.exists('user.session'):
-            print("   📂 Session file found, connecting...")
             await user.connect()
-            
             if not await user.is_user_authorized():
-                print("   ⚠️  Session expired or invalid")
+                print("⚠️ Session expired")
                 return
-            else:
-                print("   ✅ Session valid, authorizing...")
-                await user.start(phone=PHONE)
+            await user.start(phone=PHONE)
         else:
-            print("   ⚠️  No session file found")
             await user.start(phone=PHONE)
         
         user_me = await user.get_me()
-        print(f"   ✅ User: {user_me.first_name}")
+        print(f"✅ User: {user_me.first_name}")
         
     except Exception as e:
-        print(f"\n❌ Authentication failed: {e}")
+        print(f"❌ Auth failed: {e}")
         return
     
-    # Register handlers
     @bot.on(events.NewMessage(pattern='/start'))
     async def start_cmd(event):
         if event.is_private:
             await event.respond(
-                "🚀 **SEQUENTIAL VIDEO DOWNLOADER BOT**\n\n"
-                "**⚡ Features:**\n"
-                "• Sequential processing (one by one)\n"
-                "• No timeout limits\n"
-                "• Send multiple links at once\n"
-                "• Real-time progress for each file\n"
-                "• Download speed & ETA tracking\n"
-                "• Automatic retry on failures\n\n"
-                "**📋 How to use:**\n"
-                "1. Send one or more Telegram video links\n"
-                "   (You can paste multiple links at once)\n"
-                "2. Files will be processed one after another\n"
-                "3. Each file gets its own progress tracker\n"
-                "4. Get detailed completion summary\n\n"
-                "**📗 Supported formats:**\n"
-                "• t.me/channel/123\n"
-                "• https://t.me/c/123/456\n\n"
-                "**💡 Pro tip:**\n"
-                "Send all your links at once! The bot will queue them\n"
-                "and process each one automatically. No need to wait!\n\n"
-                "**🔧 Commands:**\n"
-                "/start - Show this help\n"
-                "/stats - Show bot statistics\n"
-                "/clear - Cancel current batch and clear queue"
+                "🚀 **FILE DOWNLOADER BOT** (FIXED)\n\n"
+                "**Features:**\n"
+                "• Downloads ANY media type (videos, PDFs, documents, photos)\n"
+                "• Supports forum topics\n"
+                "• Sequential processing\n"
+                "• Progress tracking\n\n"
+                "**Usage:**\n"
+                "Send Telegram message links containing media\n\n"
+                "**Commands:**\n"
+                "/start - Help\n"
+                "/list [link] - List all media in a topic\n"
+                "/clear - Cancel batch\n"
+                "/folder [ID] - Change Drive folder\n"
+                "/stats - Statistics\n\n"
+                "**Example:**\n"
+                "`/list https://t.me/c/123/2/456` - Lists all media in topic 2"
             )
+    
+    @bot.on(events.NewMessage(pattern='/list'))
+    async def list_cmd(event):
+        if event.is_private:
+            # Get the link from the message
+            text = event.raw_text.strip()
+            parts = text.split(maxsplit=1)
+            
+            if len(parts) < 2:
+                await event.respond(
+                    "📋 **List Media in Topic**\n\n"
+                    "**Usage:**\n"
+                    "`/list https://t.me/c/.../TOPIC_ID/MSG_ID`\n\n"
+                    "This will show all media files in that topic with their links."
+                )
+                return
+            
+            link = parts[1].strip()
+            channel_id, topic_id, msg_id, is_private = parse_link(link)
+            
+            if not channel_id or not topic_id:
+                await event.respond("❌ Invalid link or not a topic link")
+                return
+            
+            status_msg = await event.respond(f"🔍 Scanning topic {topic_id}...")
+            
+            try:
+                # Get all messages from the topic
+                messages_with_media = []
+                
+                if is_private:
+                    await user.get_dialogs()
+                    # Get messages from topic
+                    async for msg in user.iter_messages(channel_id, reply_to=topic_id, limit=500):
+                        if hasattr(msg, 'media') and msg.media:
+                            # Get file name
+                            file_name = "Unknown"
+                            file_type = "Unknown"
+                            
+                            if hasattr(msg.media, 'document') and msg.media.document:
+                                for attr in msg.media.document.attributes:
+                                    if hasattr(attr, 'file_name') and attr.file_name:
+                                        file_name = attr.file_name
+                                        break
+                                
+                                if hasattr(msg.media.document, 'mime_type'):
+                                    mime = msg.media.document.mime_type
+                                    if 'pdf' in mime:
+                                        file_type = "PDF"
+                                    elif 'video' in mime:
+                                        file_type = "Video"
+                                    elif 'image' in mime:
+                                        file_type = "Image"
+                                    else:
+                                        file_type = mime.split('/')[-1].upper()
+                            elif hasattr(msg.media, 'photo'):
+                                file_name = f"Photo_{msg.id}"
+                                file_type = "Photo"
+                            
+                            messages_with_media.append({
+                                'id': msg.id,
+                                'name': file_name,
+                                'type': file_type,
+                                'link': f"https://t.me/c/{str(channel_id)[4:]}/{topic_id}/{msg.id}"
+                            })
+                
+                if not messages_with_media:
+                    await status_msg.edit("❌ No media found in this topic")
+                    return
+                
+                # Update status
+                await status_msg.edit(f"📋 Found {len(messages_with_media)} media files! Sending list...")
+                
+                # Split into chunks of 15 files per message to avoid message length limit
+                chunk_size = 15
+                for chunk_idx in range(0, len(messages_with_media), chunk_size):
+                    chunk = messages_with_media[chunk_idx:chunk_idx + chunk_size]
+                    
+                    if chunk_idx == 0:
+                        response = f"📋 **Topic {topic_id} - {len(messages_with_media)} files (Part 1)**\n\n"
+                    else:
+                        part_num = (chunk_idx // chunk_size) + 1
+                        response = f"📋 **Topic {topic_id} (Part {part_num})**\n\n"
+                    
+                    for item in chunk:
+                        idx = messages_with_media.index(item) + 1
+                        response += f"**{idx}. [{item['type']}]** `{item['name'][:35]}`\n"
+                        response += f"`{item['link']}`\n\n"
+                    
+                    if chunk_idx + chunk_size >= len(messages_with_media):
+                        response += "💡 **Copy any link and send to download!**"
+                    
+                    await event.respond(response)
+                    await asyncio.sleep(0.5)  # Small delay between messages
+                
+            except Exception as e:
+                print(f"List error: {e}")
+                import traceback
+                traceback.print_exc()
+                await status_msg.edit(f"❌ Error: {str(e)}")
     
     @bot.on(events.NewMessage(pattern='/clear'))
     async def clear_cmd(event):
         if event.is_private:
             user_id = event.sender_id
-            
             if user_id not in user_queue or not user_queue[user_id]:
-                await event.respond("ℹ️ No active downloads to clear")
+                await event.respond("ℹ️ No active downloads")
                 return
             
-            # Mark as cancelled
             user_queue[user_id] = False
-            
-            # Clean up downloads directory
             try:
                 cleaned = 0
                 for file in os.listdir(DOWNLOAD_DIR):
-                    file_path = os.path.join(DOWNLOAD_DIR, file)
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
-                        cleaned += 1
-                
-                await event.respond(
-                    f"🛑 **CLEARING QUEUE**\n\n"
-                    f"✅ Cancellation signal sent\n"
-                    f"🧹 Cleaned {cleaned} pending files\n\n"
-                    f"Current download will complete, then batch will stop.\n"
-                    f"You can send new links now!"
-                )
-                print(f"User {user_id} cleared queue - cleaned {cleaned} files")
+                    os.remove(os.path.join(DOWNLOAD_DIR, file))
+                    cleaned += 1
+                await event.respond(f"🛑 Cancelled! Cleaned {cleaned} files")
+                print(f"User {user_id} cleared queue")
             except Exception as e:
-                await event.respond(f"⚠️ Queue cleared but cleanup error: {str(e)}")
-                print(f"Clear error: {e}")
+                await event.respond(f"⚠️ Error: {e}")
     
     @bot.on(events.NewMessage(pattern='/folder'))
     async def folder_cmd(event):
         if event.is_private:
             global DRIVE_FOLDER_ID
-            
-            # Get text after command
             text = event.raw_text.strip()
             
             if text == '/folder':
-                # Show current folder ID
                 await event.respond(
-                    f"📁 **Current Google Drive Folder**\n\n"
-                    f"**Folder ID:** `{DRIVE_FOLDER_ID}`\n\n"
-                    f"**To change folder:**\n"
-                    f"Send: `/folder YOUR_FOLDER_ID`\n\n"
-                    f"**Example:**\n"
-                    f"`/folder 1e1KS9b8iqNMMX4c3nlJvrUCaO2sO5ANO`\n\n"
-                    f"**How to get Folder ID:**\n"
-                    f"1. Open folder in Google Drive\n"
-                    f"2. Copy ID from URL:\n"
-                    f"   `drive.google.com/drive/folders/[FOLDER_ID]`"
+                    f"📁 **Current Folder**\n\n"
+                    f"`{DRIVE_FOLDER_ID}`\n\n"
+                    f"**Change:**\n"
+                    f"`/folder YOUR_FOLDER_ID`"
                 )
                 return
             
-            # Extract new folder ID
             parts = text.split(maxsplit=1)
             if len(parts) < 2:
-                await event.respond("❌ Please provide a folder ID\n\nUsage: `/folder YOUR_FOLDER_ID`")
+                await event.respond("❌ Usage: `/folder YOUR_FOLDER_ID`")
                 return
             
-            new_folder_id = parts[1].strip()
-            
-            # Validate folder ID (basic check)
-            if len(new_folder_id) < 20 or ' ' in new_folder_id:
-                await event.respond("❌ Invalid folder ID format\n\nFolder ID should be a long string without spaces")
+            new_id = parts[1].strip()
+            if len(new_id) < 20:
+                await event.respond("❌ Invalid folder ID")
                 return
             
-            # Save to file
             try:
                 with open(FOLDER_ID_FILE, 'w') as f:
-                    f.write(new_folder_id)
-                
-                old_folder_id = DRIVE_FOLDER_ID
-                DRIVE_FOLDER_ID = new_folder_id
-                
-                await event.respond(
-                    f"✅ **Folder Updated Successfully!**\n\n"
-                    f"**Old Folder ID:**\n`{old_folder_id}`\n\n"
-                    f"**New Folder ID:**\n`{new_folder_id}`\n\n"
-                    f"All new uploads will go to the new folder.\n"
-                    f"Change persists across bot restarts!"
-                )
-                print(f"Folder ID changed from {old_folder_id} to {new_folder_id}")
+                    f.write(new_id)
+                old_id = DRIVE_FOLDER_ID
+                DRIVE_FOLDER_ID = new_id
+                await event.respond(f"✅ Updated!\n\nOld: `{old_id}`\nNew: `{new_id}`")
+                print(f"Folder changed to: {new_id}")
             except Exception as e:
-                await event.respond(f"❌ Failed to save folder ID: {str(e)}")
-                print(f"Folder save error: {e}")
+                await event.respond(f"❌ Failed: {e}")
     
     @bot.on(events.NewMessage(pattern='/stats'))
     async def stats_cmd(event):
         if event.is_private:
             await event.respond(
-                f"📊 **Bot Statistics**\n\n"
-                f"🔄 Processing mode: Sequential (one by one)\n"
-                f"📡 Connection retries: {CONNECTION_RETRIES}\n"
-                f"⏱️ Progress update interval: {PROGRESS_UPDATE_INTERVAL}s\n"
-                f"⏰ No timeout limits\n\n"
-                f"🤖 Status: ✅ Running\n"
-                f"👥 Active queues: {len([v for v in user_queue.values() if v])}"
+                f"📊 **Statistics**\n\n"
+                f"🔄 Mode: Sequential\n"
+                f"⏱️ Update: {PROGRESS_UPDATE_INTERVAL}s\n"
+                f"🔁 Retries: {CONNECTION_RETRIES}\n"
+                f"👥 Active: {len([v for v in user_queue.values() if v])}"
             )
     
     @bot.on(events.NewMessage)
@@ -676,14 +743,8 @@ async def main():
         if event.is_private and not event.raw_text.startswith('/'):
             await handle_message(event, bot, user)
     
-    print("\n" + "="*70)
-    print("✅ BOT IS RUNNING!")
-    print("="*70)
-    print(f"\n📱 Bot: @{bot_me.username}")
-    print(f"👤 User: {user_me.first_name}")
-    print(f"🔄 Mode: Sequential (one by one)")
-    print(f"⏰ No timeout limits")
-    print(f"\n⏳ Press Ctrl+C to stop\n")
+    print("✅ BOT RUNNING")
+    print("⏳ Press Ctrl+C to stop\n")
     
     try:
         await bot.run_until_disconnected()
